@@ -1,0 +1,20 @@
+{
+  "version": "pwmi_v1",
+  "build_time": "2025-10-08",
+  "source_phase3": "D:\\BaiduSyncdisk\\机器学习测试用\\outputs\\特征选择\\phase3_external\\phase3_20251008_161045",
+  "joblib_from": "D:\\BaiduSyncdisk\\机器学习测试用\\outputs\\特征选择\\phase3_external\\phase3_20251008_161045\\final_pipeline.joblib",
+  "features": [
+    "alb",
+    "ldh",
+    "apgar_1min",
+    "hbdh",
+    "aop",
+    "inv_vent_days",
+    "seizure",
+    "birth_weight_g"
+  ],
+  "thresholds": {
+    "youden": 0.19048782162954836,
+    "high_sensitivity": 0.12352577516884608
+  }
+}
