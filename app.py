@@ -93,10 +93,42 @@ DISPLAY = {
 # ===========================
 @st.cache_resource
 def load_assets():
+    # 1) 先确定文件存在
     if not PIPE_PATH.exists():
+        st.error(f"未找到模型文件：{PIPE_PATH.name}。请将模型文件放到应用根目录。")
         st.stop()
-    pipe = joblib.load(PIPE_PATH)
 
+    # 2) 更稳健的加载器：
+    #    - 若同名 .skops 文件存在，优先用 skops（避免 joblib 反序列化依赖本地自定义模块报错）
+    #    - 否则回退到 joblib.load
+    pipe = None
+    skops_path = PIPE_PATH.with_suffix(".skops")
+
+    # 2.1 先尝试 skops
+    if skops_path.exists():
+        try:
+            import skops.io as sio  # 仅在需要时导入，requirements 里建议加入 `skops`
+            pipe = sio.load(skops_path, trusted=True)
+        except Exception as e:
+            st.warning(f"读取 SKOPS 模型失败（将回退到 joblib）：{e}")
+
+    # 2.2 若还没有成功，回退到 joblib
+    if pipe is None:
+        try:
+            pipe = joblib.load(PIPE_PATH)
+        except ModuleNotFoundError as e:
+            st.error(
+                "无法通过 joblib 加载模型，通常是因为训练时的自定义模块/路径在云端不存在。\n"
+                "解决方案之一：在本地把模型导出为 SKOPS 格式（如 final_pipeline.skops）并上传到仓库根目录；"
+                "或将模型中用到的自定义类/函数随应用一起打包。"
+                f"\n原始错误：{e}"
+            )
+            st.stop()
+        except Exception as e:
+            st.error(f"加载 joblib 模型失败：{e}")
+            st.stop()
+
+    # 3) 读取 schema / 阈值 / 元信息（保持你原先逻辑）
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     order = schema.get("order") or [d["name"] for d in schema["features"]]
     feat_defs = schema.get("features") or [{"name": n, "dtype": "float", "allowed_range": [None, None]} for n in order]
@@ -104,7 +136,6 @@ def load_assets():
 
     thr = json.loads(THR_PATH.read_text(encoding="utf-8"))
 
-    # 阈值兼容不同写法：直接数值 / {"thr": 数值}
     def pick(obj, *keys):
         for key in keys:
             if key in obj:
@@ -123,7 +154,6 @@ def load_assets():
             meta = {}
 
     return pipe, order, defs_by_name, {"youden": youden, "highs": highs}, meta
-
 
 pipe, order, featdefs, thrs, meta = load_assets()
 
@@ -358,3 +388,4 @@ if up is not None:
 
 st.divider()
 st.caption("Roadmap: SHAP/EBM explain, stricter schema validation, PDF export, FastAPI.")
+
