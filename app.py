@@ -1,15 +1,19 @@
-# app.py — PWMI 预测原型（多语言 + 字段提示 + 风险等级/句子 + 批量导出）
-# 依赖：pip install streamlit pandas joblib numpy
-import json, io
+# app.py — PWMI 预测原型（远程下载模型 + 缓存 + 多语言 + 批量导出）
+# 依赖：streamlit pandas numpy scikit-learn joblib imbalanced-learn lightgbm catboost skops requests
+# 建议 Python 3.11（Streamlit Cloud 用 runtime.txt: python-3.11.9）
+
+import json, io, os, hashlib, tempfile, shutil, time
 from pathlib import Path
+from typing import List, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 # =========================
-# 1) 多语言文本（可自行扩展）
+# 0) 多语言文本
 # =========================
 TEXT = {
     "lang_label": {"zh": "界面语言", "en": "Interface language"},
@@ -50,11 +54,19 @@ TEXT = {
     },
     "read_fail": {"zh": "读取或预测失败：", "en": "Read / prediction failed: "},
     "done_n": {"zh": "预测完成：{n} 条", "en": "Done: {n} rows"},
+    "model_missing": {
+        "zh": "未找到本地模型，也未配置远程下载地址。请在 Secrets 中设置 MODEL_URL 或 MODEL_URLS。",
+        "en": "No local model and no remote URL configured. Please set MODEL_URL or MODEL_URLS in Secrets.",
+    },
+    "downloading": {"zh": "下载模型文件…", "en": "Downloading model file…"},
+    "verifying": {"zh": "校验文件完整性…", "en": "Verifying file integrity…"},
+    "merging": {"zh": "合并分片…", "en": "Merging parts…"},
+    "cached": {"zh": "已命中缓存，跳过下载。", "en": "Cache hit, skip download."},
+    "skops_fail": {"zh": "读取 SKOPS 失败，将回退到 joblib：", "en": "SKOPS load failed, fallback to joblib: "},
+    "joblib_fail": {"zh": "加载 joblib 模型失败：", "en": "Load joblib failed: "},
 }
 
-# ===============
-# 2) 语言选择
-# ===============
+# =============== 语言选择 ===============
 st.set_page_config(page_title=TEXT["title"]["zh"], layout="centered")
 lang_choice = st.sidebar.radio(
     f'{TEXT["lang_label"]["zh"]} / {TEXT["lang_label"]["en"]}',
@@ -63,15 +75,18 @@ lang_choice = st.sidebar.radio(
     horizontal=True,
 )
 LANG = "zh" if lang_choice == "中文" else "en"
-# 更新标题
 st.title(TEXT["title"][LANG])
 st.caption(TEXT["caption"][LANG])
 
-# =============================
-# 3) 路径与发布物（与原版一致）
-# =============================
+# =============== 常量与路径 ===============
 ROOT = Path(__file__).parent
-PIPE_PATH = ROOT / "final_pipeline.joblib"
+CACHE_DIR = ROOT / ".model_cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+# 本地优先文件名（如仓库里已经带 skops/joblib 则直接用，优先 skops）
+LOCAL_SKOPS = ROOT / "final_pipeline.skops"
+LOCAL_JOBLIB = ROOT / "final_pipeline.joblib"
+
 SCHEMA_PATH = ROOT / "feature_schema.json"
 THR_PATH = ROOT / "thresholds.json"
 META_PATH = ROOT / "release_meta.json"
@@ -88,56 +103,157 @@ DISPLAY = {
     "birth_weight_g": {"zh": "出生体重 (g)",       "en": "Birth weight (g)"},
 }
 
-# ===========================
-# 4) 载入资产（缓存）
-# ===========================
+# =============== 工具：下载 & 校验 ===============
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def download_one(url: str, dst: Path, progress: Optional[st.delta_generator.DeltaGenerator]=None) -> None:
+    # 简单流式下载（支持 http(s) 直链）
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        got = 0
+        with dst.open("wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    got += len(chunk)
+                    if progress and total:
+                        progress.progress(min(1.0, got / total))
+
+def merge_files(parts: List[Path], dst: Path) -> None:
+    with dst.open("wb") as out:
+        for p in parts:
+            with p.open("rb") as f:
+                shutil.copyfileobj(f, out)
+
+def get_urls_from_secrets_or_env() -> (List[str], Optional[str]):
+    """从 st.secrets / 环境变量读取 MODEL_URL(S) 与可选的 MODEL_SHA256"""
+    urls = []
+    sha = None
+    # 优先 secrets
+    try:
+        if "MODEL_URLS" in st.secrets:
+            urls = [u.strip() for u in str(st.secrets["MODEL_URLS"]).strip().splitlines() if u.strip()]
+        elif "MODEL_URL" in st.secrets:
+            urls = [str(st.secrets["MODEL_URL"]).strip()]
+        if "MODEL_SHA256" in st.secrets:
+            sha = str(st.secrets["MODEL_SHA256"]).strip().lower()
+    except Exception:
+        pass
+    # 回退环境变量
+    if not urls:
+        env_urls = os.environ.get("MODEL_URLS") or os.environ.get("MODEL_URL") or ""
+        if env_urls.strip():
+            # 兼容逗号/换行
+            if "\n" in env_urls:
+                urls = [u.strip() for u in env_urls.strip().splitlines() if u.strip()]
+            else:
+                urls = [u.strip() for u in env_urls.split(",") if u.strip()]
+    if sha is None:
+        sha = os.environ.get("MODEL_SHA256", None)
+        if sha:
+            sha = sha.strip().lower()
+    return urls, sha
+
+def ensure_model_file() -> Path:
+    """
+    返回可用的模型文件路径：
+    - 如果本地有 final_pipeline.skops，直接使用
+    - 否则如果本地有 joblib（且你愿意承担版本不一致风险），也可用
+    - 否则读取 MODEL_URL(S) 下载到缓存（单文件或分片），合并并校验 SHA256（若提供）
+    """
+    if LOCAL_SKOPS.exists():
+        return LOCAL_SKOPS
+    if LOCAL_JOBLIB.exists():
+        return LOCAL_JOBLIB
+
+    urls, sha = get_urls_from_secrets_or_env()
+    if not urls:
+        st.error(TEXT["model_missing"][LANG])
+        st.stop()
+
+    is_multipart = len(urls) > 1
+    target = CACHE_DIR / "final_pipeline.skops"
+    # 如果已有且（若提供 SHA）校验通过，直接复用
+    if target.exists() and (not sha or sha256_file(target) == sha):
+        st.info(TEXT["cached"][LANG])
+        return target
+
+    # 下载
+    if is_multipart:
+        st.info(TEXT["downloading"][LANG])
+        tmp_dir = Path(tempfile.mkdtemp())
+        part_paths = []
+        for i, url in enumerate(urls):
+            st.write(f"Part {i+1}/{len(urls)}")
+            part_path = tmp_dir / f"part_{i:03d}"
+            bar = st.progress(0.0)
+            download_one(url, part_path, progress=bar)
+            part_paths.append(part_path)
+        st.info(TEXT["merging"][LANG])
+        merge_files(part_paths, target)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        st.info(TEXT["downloading"][LANG])
+        bar = st.progress(0.0)
+        download_one(urls[0], target.with_suffix(".down"), progress=bar)
+        target_tmp = target.with_suffix(".down")
+        target_tmp.replace(target)
+
+    # 校验
+    if sha:
+        st.info(TEXT["verifying"][LANG])
+        got = sha256_file(target)
+        if got.lower() != sha.lower():
+            target.unlink(missing_ok=True)
+            st.error(
+                (TEXT["read_fail"][LANG] if LANG == "zh" else TEXT["read_fail"][LANG])
+                + f"SHA256 mismatch. expected={sha}, got={got}"
+            )
+            st.stop()
+
+    return target
+
+# =============== 载入资产（模型 + schema/阈值/元信息） ===============
 @st.cache_resource
 def load_assets():
-    # 统一的候选路径：优先 SKOPS，再回退 joblib
-SKOPS_PATH = ROOT / "final_pipeline.skops"
-JOBLIB_PATH = ROOT / "final_pipeline.joblib"  # 与 PIPE_PATH 等价
+    # 确保有模型：优先本地，否则远程下载到缓存
+    model_path = ensure_model_file()
 
-# 1) 先检查两种格式是否都不存在
-if (not SKOPS_PATH.exists()) and (not JOBLIB_PATH.exists()):
-    st.error("未找到模型文件：请上传 final_pipeline.skops（推荐）或 final_pipeline.joblib 到应用根目录。")
-    st.stop()
+    # 先尝试 SKOPS，再回退 joblib
+    pipe = None
+    if model_path.suffix == ".skops":
+        try:
+            import skops.io as sio
+            pipe = sio.load(model_path, trusted=True)
+        except Exception as e:
+            st.warning(TEXT["skops_fail"][LANG] + str(e))
 
-# 2) 更稳健的加载器
-pipe = None
+    if pipe is None:
+        try:
+            pipe = joblib.load(model_path)
+        except ModuleNotFoundError as e:
+            st.error(
+                "无法通过 joblib 加载模型，通常是因为训练时的自定义模块/路径在云端不存在。\n"
+                "优先使用 SKOPS（final_pipeline.skops），或把自定义类/函数随应用一起打包。\n"
+                f"原始错误：{e}"
+            )
+            st.stop()
+        except Exception as e:
+            st.error(TEXT["joblib_fail"][LANG] + str(e))
+            st.stop()
 
-# 2.1 若有 SKOPS，优先用（避免 joblib 对训练环境/自定义类的强绑定）
-if SKOPS_PATH.exists():
-    try:
-        import skops.io as sio  # 建议在 requirements.txt 中加入 `skops`
-        # 如果你的模型只包含 sklearn/内置对象，可设 trusted=False；含少量第三方对象可设 True
-        pipe = sio.load(SKOPS_PATH, trusted=True)
-    except Exception as e:
-        st.warning(f"读取 SKOPS 模型失败（将尝试回退到 joblib）：{e}")
-
-# 2.2 若 SKOPS 未成功且有 joblib，则回退
-if pipe is None and JOBLIB_PATH.exists():
-    try:
-        pipe = joblib.load(JOBLIB_PATH)
-    except ModuleNotFoundError as e:
-        # 典型如：No module named 'interpret'
-        st.error(
-            "无法通过 joblib 加载模型：训练时的自定义模块/路径在云端不存在。\n"
-            "建议方案：\n"
-            "  A. 在训练环境将模型导出为 SKOPS（final_pipeline.skops）并提交（推荐）；\n"
-            "  B. 或在 requirements.txt 中加入缺失依赖（如 interpret）并与训练版本对齐；\n"
-            "  C. 或将云端 scikit-learn 版本与训练端一致后再用 joblib。\n"
-            f"原始错误：{e}"
-        )
-        st.stop()
-    except Exception as e:
-        st.error(f"加载 joblib 模型失败：{e}")
-        st.stop()
-
-
-    # 3) 读取 schema / 阈值 / 元信息（保持你原先逻辑）
+    # 读取 schema / 阈值 / 元信息
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     order = schema.get("order") or [d["name"] for d in schema["features"]]
-    feat_defs = schema.get("features") or [{"name": n, "dtype": "float", "allowed_range": [None, None]} for n in order]
+    feat_defs = schema.get("features") or [
+        {"name": n, "dtype": "float", "allowed_range": [None, None]} for n in order
+    ]
     defs_by_name = {d["name"]: d for d in feat_defs}
 
     thr = json.loads(THR_PATH.read_text(encoding="utf-8"))
@@ -166,35 +282,25 @@ pipe, order, featdefs, thrs, meta = load_assets()
 with st.expander(TEXT["meta"][LANG], expanded=False):
     st.json(meta or {"note": "N/A"})
 
-# =====================================
-# 5) 工具函数：二元识别 / 标签与提示（大小写无关）
-# =====================================
-
-# ① 大小写无关的显示映射：把 DISPLAY 的 key 全部转成小写做查找
+# =============== 工具：二元识别 / 标签与提示 ===============
 DISPLAY_CI = {k.lower(): v for k, v in DISPLAY.items()}
-
-# ② 常见的二元变量名称（全小写）；可按需增删
 BINARY_FEATURES = {
     "seizure", "aop", "pda", "bpd", "rds",
     "ivh", "sepsis", "asphyxia", "hypoglycemia",
     "hypocalcemia", "phototherapy", "steroids",
     "ventilation", "invasive_vent", "inv_vent", "cpap",
-    # 以 _flag/_bin 结尾的也按二元处理（见 is_binary_name）
 }
-# 明确是“天数/小时数”的不要放进来（如 inv_vent_days）
 
 def is_binary_name(name: str) -> bool:
     n = str(name).lower()
     if n in BINARY_FEATURES:
         return True
-    # 变量名以这些后缀结尾，也视为二元
     for suf in ("_flag", "_bin", "_binary"):
         if n.endswith(suf):
             return True
     return False
 
 def is_binary_def(defn: dict, name: str) -> bool:
-    """多策略判断是否二元：dtype/allowed_range/变量名启发式"""
     dtype = str(defn.get("dtype", "")).lower()
     if dtype == "binary":
         return True
@@ -206,19 +312,16 @@ def is_binary_def(defn: dict, name: str) -> bool:
                 return True
         except Exception:
             pass
-    # 最后用名称启发式
     return is_binary_name(name)
 
 def label_for(name: str, defn: dict) -> str:
-    """按 DISPLAY（大小写无关） → 否则用 列名(+单位)"""
     unit = defn.get("unit") or ""
     mapped = DISPLAY_CI.get(str(name).lower(), {}).get(LANG)
     if mapped:
-        return mapped  # 已含单位
+        return mapped
     return f"{name} ({unit})" if unit else str(name)
 
 def help_for(defn: dict, is_bin: bool) -> str:
-    """生成 tooltip：范围/步进 + 二元说明"""
     lo, hi = (defn.get("allowed_range") or [None, None])
     step = defn.get("step", 1 if is_bin else 0.1)
     bits = []
@@ -229,9 +332,7 @@ def help_for(defn: dict, is_bin: bool) -> str:
         bits.append(TEXT["binary_help"][LANG])
     return " · ".join(bits)
 
-# ===========================
-# 6) 表单输入（带提示/二元下拉）
-# ===========================
+# =============== 表单输入 ===============
 st.markdown(f"### {TEXT['input_section'][LANG]}")
 cols = st.columns(2)
 values = {}
@@ -245,14 +346,11 @@ for i, name in enumerate(order):
 
     with cols[i % 2]:
         if is_bin:
-            # 二元变量：用下拉 0/1，既有 tooltip，也在控件下方再写一遍文字提示
             values[name] = st.selectbox(
                 lbl, options=[0, 1], index=0, help=help_text, key=f"bin_{name}"
             )
-            # 在控件下方**再明确**写一次，避免用户没注意到问号提示
             st.caption(TEXT["binary_help"][LANG])
         else:
-            # 数值变量：默认值 = 范围中点，否则 0.0
             if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
                 default = (float(lo) + float(hi)) / 2.0
                 step = float(d.get("step", 0.1))
@@ -273,7 +371,7 @@ for i, name in enumerate(order):
                     format="%.3f",
                     help=help_text,
                 )
-# —— 6.5) 阈值策略 + 预测按钮（必须先定义，后面要用） ——
+
 st.divider()
 mode = st.radio(
     TEXT["thresh_mode"][LANG],
@@ -282,13 +380,10 @@ mode = st.radio(
 )
 btn_predict = st.button(TEXT["predict"][LANG], type="primary")
 
-# ===========================
-# 7) 风险分级规则（基于两阈值）
-# ===========================
+# =============== 风险分级规则（两阈值） ===============
 def pick_thresholds(thrs_dict):
     t_youden = thrs_dict.get("youden")
     t_hsens = thrs_dict.get("highs")
-    # 缺失兜底
     if t_youden is None:
         t_youden = 0.5
     if t_hsens is None:
@@ -306,9 +401,7 @@ def risk_bucket(p: float, lang="zh") -> str:
     else:
         return TEXT["risk_high"][lang]
 
-# ===========================
-# 8) 单例预测
-# ===========================
+# =============== 单例预测 ===============
 if btn_predict:
     x = pd.DataFrame([values])[order]
     p = float(pipe.predict_proba(x)[:, 1][0])
@@ -323,11 +416,9 @@ if btn_predict:
     final_label = label_youden if mode == TEXT["youd"][LANG] else label_highs
     st.success(f"{TEXT['current_mode'][LANG]}：**{mode}** → {TEXT['result'][LANG]}：**{TEXT['pos'][LANG] if final_label else TEXT['neg'][LANG]}**")
 
-    # 风险等级句子（显示 + 报告写入）
     risk_sent = TEXT["risk_sentence"][LANG].format(level=risk_bucket(p, LANG), p=p)
     st.write(risk_sent)
 
-    # HTML 报告
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>PWMI Report</title>
 <style>
@@ -358,9 +449,7 @@ td,th{{border:1px solid #ddd;padding:6px 8px;}} .ok{{color:#0b8a00;}} .bad{{colo
     st.download_button(TEXT["download_html"][LANG], data=html.encode("utf-8"),
                        file_name="pwmi_report.html", mime="text/html")
 
-# ===========================
-# 9) 批量 CSV 预测 + 风险句子
-# ===========================
+# =============== 批量 CSV 预测 + 风险句子 ===============
 st.markdown(f"### {TEXT['batch_title'][LANG]}")
 st.caption(TEXT["batch_caption"][LANG])
 up = st.file_uploader(TEXT["upload_csv"][LANG], type=["csv"], accept_multiple_files=False)
@@ -374,7 +463,6 @@ if up is not None:
         out["prob"] = p
         out["label_youden"] = (p >= t_youden).astype(int)
         out["label_highsens"] = (p >= t_hsens).astype(int)
-        # 风险等级 + 句子（中英文）
         out["risk_level_zh"] = [risk_bucket(float(x), "zh") for x in p]
         out["risk_level_en"] = [risk_bucket(float(x), "en") for x in p]
         out["summary_zh"] = [TEXT["risk_sentence"]["zh"].format(level=risk_bucket(float(x), "zh"), p=float(x)) for x in p]
@@ -394,5 +482,3 @@ if up is not None:
 
 st.divider()
 st.caption("Roadmap: SHAP/EBM explain, stricter schema validation, PDF export, FastAPI.")
-
-
