@@ -96,7 +96,7 @@ DISPLAY = {
     "ldh":  {"zh": "乳酸脱氢酶 (LDH, U/L)",        "en": "Lactate Dehydrogenase (LDH, U/L)"},
     "hbdh": {"zh": "α-羟丁酸脱氢酶 (HBDH, U/L)",  "en": "α-Hydroxybutyrate Dehydrogenase (HBDH, U/L)"},
     "apgar_1min": {"zh": "Apgar 1分钟评分（1-10）",        "en": "Apgar at 1 minute"},
-    "aop":  {"zh": "早产儿贫血 (AOP, 0/1)",    "en": "Apnea of prematurity (AOP, 0/1)"},
+    "aop":  {"zh": "早产儿呼吸暂停 (AOP, 0/1)",    "en": "Apnea of prematurity (AOP, 0/1)"},
     "seizure": {"zh": "惊厥 (0/1)",           "en": "Clinical seizure (0/1)"},
     "inv_vent_days": {"zh": "有创通气天数 (d)",    "en": "Invasive ventilation (days)"},
     "birth_weight_g": {"zh": "出生体重 (g)",       "en": "Birth weight (g)"},
@@ -110,7 +110,7 @@ def sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def download_one(url: str, dst: Path, progress: Optional[st.delta_generator.DeltaGenerator]=None) -> None:
+def download_one(url: str, dst: Path, progress=None) -> None:
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", 0))
@@ -205,7 +205,6 @@ def ensure_model_file() -> Path:
 def safe_skops_load(path: Path):
     import skops, skops.io as sio
     ver = Version(skops.__version__)
-    # 允许用户通过 Secrets/ENV 自定义信任前缀（逗号分隔）
     default_prefixes = ("sklearn.", "numpy.", "scipy.", "lightgbm", "catboost", "xgboost", "skops.")
     allow_env = (st.secrets.get("SKOPS_ALLOWED_PREFIXES", None)
                  if hasattr(st, "secrets") else None) or os.environ.get("SKOPS_ALLOWED_PREFIXES", "")
@@ -218,11 +217,9 @@ def safe_skops_load(path: Path):
                  if hasattr(st, "secrets") else os.environ.get("SKOPS_TRUST_ALL", "")) \
                  .strip().lower() in {"1", "true", "yes"}
 
-    # 0.10 之前：仍接受 bool
     if ver < Version("0.10"):
         return sio.load(path, trusted=True)
 
-    # 0.10 及以上：必须传字符串列表
     untrusted = sio.get_untrusted_types(path)
 
     if trust_all:
@@ -466,7 +463,7 @@ td,th{{border:1px solid #ddd;padding:6px 8px;}} .ok{{color:#0b8a00;}} .bad{{colo
 
 # =============== 批量 CSV 预测 + 风险句子 ===============
 st.markdown(f"### {TEXT['batch_title'][LANG]}")
-st.caption(TEXT["batch_caption"][LANG]")
+st.caption(TEXT["batch_caption"][LANG])
 up = st.file_uploader(TEXT["upload_csv"][LANG], type=["csv"], accept_multiple_files=False)
 
 if up is not None:
