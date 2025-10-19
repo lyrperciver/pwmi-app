@@ -93,40 +93,46 @@ DISPLAY = {
 # ===========================
 @st.cache_resource
 def load_assets():
-    # 1) 先确定文件存在
-    if not PIPE_PATH.exists():
-        st.error(f"未找到模型文件：{PIPE_PATH.name}。请将模型文件放到应用根目录。")
+    # 统一的候选路径：优先 SKOPS，再回退 joblib
+SKOPS_PATH = ROOT / "final_pipeline.skops"
+JOBLIB_PATH = ROOT / "final_pipeline.joblib"  # 与 PIPE_PATH 等价
+
+# 1) 先检查两种格式是否都不存在
+if (not SKOPS_PATH.exists()) and (not JOBLIB_PATH.exists()):
+    st.error("未找到模型文件：请上传 final_pipeline.skops（推荐）或 final_pipeline.joblib 到应用根目录。")
+    st.stop()
+
+# 2) 更稳健的加载器
+pipe = None
+
+# 2.1 若有 SKOPS，优先用（避免 joblib 对训练环境/自定义类的强绑定）
+if SKOPS_PATH.exists():
+    try:
+        import skops.io as sio  # 建议在 requirements.txt 中加入 `skops`
+        # 如果你的模型只包含 sklearn/内置对象，可设 trusted=False；含少量第三方对象可设 True
+        pipe = sio.load(SKOPS_PATH, trusted=True)
+    except Exception as e:
+        st.warning(f"读取 SKOPS 模型失败（将尝试回退到 joblib）：{e}")
+
+# 2.2 若 SKOPS 未成功且有 joblib，则回退
+if pipe is None and JOBLIB_PATH.exists():
+    try:
+        pipe = joblib.load(JOBLIB_PATH)
+    except ModuleNotFoundError as e:
+        # 典型如：No module named 'interpret'
+        st.error(
+            "无法通过 joblib 加载模型：训练时的自定义模块/路径在云端不存在。\n"
+            "建议方案：\n"
+            "  A. 在训练环境将模型导出为 SKOPS（final_pipeline.skops）并提交（推荐）；\n"
+            "  B. 或在 requirements.txt 中加入缺失依赖（如 interpret）并与训练版本对齐；\n"
+            "  C. 或将云端 scikit-learn 版本与训练端一致后再用 joblib。\n"
+            f"原始错误：{e}"
+        )
+        st.stop()
+    except Exception as e:
+        st.error(f"加载 joblib 模型失败：{e}")
         st.stop()
 
-    # 2) 更稳健的加载器：
-    #    - 若同名 .skops 文件存在，优先用 skops（避免 joblib 反序列化依赖本地自定义模块报错）
-    #    - 否则回退到 joblib.load
-    pipe = None
-    skops_path = PIPE_PATH.with_suffix(".skops")
-
-    # 2.1 先尝试 skops
-    if skops_path.exists():
-        try:
-            import skops.io as sio  # 仅在需要时导入，requirements 里建议加入 `skops`
-            pipe = sio.load(skops_path, trusted=True)
-        except Exception as e:
-            st.warning(f"读取 SKOPS 模型失败（将回退到 joblib）：{e}")
-
-    # 2.2 若还没有成功，回退到 joblib
-    if pipe is None:
-        try:
-            pipe = joblib.load(PIPE_PATH)
-        except ModuleNotFoundError as e:
-            st.error(
-                "无法通过 joblib 加载模型，通常是因为训练时的自定义模块/路径在云端不存在。\n"
-                "解决方案之一：在本地把模型导出为 SKOPS 格式（如 final_pipeline.skops）并上传到仓库根目录；"
-                "或将模型中用到的自定义类/函数随应用一起打包。"
-                f"\n原始错误：{e}"
-            )
-            st.stop()
-        except Exception as e:
-            st.error(f"加载 joblib 模型失败：{e}")
-            st.stop()
 
     # 3) 读取 schema / 阈值 / 元信息（保持你原先逻辑）
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -388,4 +394,5 @@ if up is not None:
 
 st.divider()
 st.caption("Roadmap: SHAP/EBM explain, stricter schema validation, PDF export, FastAPI.")
+
 
