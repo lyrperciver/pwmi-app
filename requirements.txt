@@ -9,3 +9,4 @@ catboost==1.2.8
 skops==0.13.0
 requests>=2.32.5
 packaging>=23.2
+interpret-core
