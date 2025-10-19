@@ -108,7 +108,7 @@ DISPLAY = {
     "ldh":  {"zh": "乳酸脱氢酶 (LDH, U/L)",        "en": "Lactate Dehydrogenase (LDH, U/L)"},
     "hbdh": {"zh": "α-羟丁酸脱氢酶 (HBDH, U/L)",  "en": "α-Hydroxybutyrate Dehydrogenase (HBDH, U/L)"},
     "apgar_1min": {"zh": "Apgar 1分钟评分（1-10）",        "en": "Apgar at 1 minute"},
-    "aop":  {"zh": "早产儿呼吸暂停 (AOP, 0/1)",    "en": "Apnea of prematurity (AOP, 0/1)"},
+    "aop":  {"zh": "早产儿贫血 (AOP, 0/1)",    "en": "Anemia of Prematurity (AOP, 0/1)"},
     "seizure": {"zh": "惊厥 (0/1)",           "en": "Clinical seizure (0/1)"},
     "inv_vent_days": {"zh": "有创通气天数 (d)",    "en": "Invasive ventilation (days)"},
     "birth_weight_g": {"zh": "出生体重 (g)",       "en": "Birth weight (g)"},
@@ -537,3 +537,4 @@ if up is not None:
 
 st.divider()
 st.caption("Roadmap: SHAP/EBM explain, stricter schema validation, PDF export, FastAPI.")
+
