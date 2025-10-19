@@ -1,16 +1,17 @@
 # app.py — PWMI 预测原型（远程下载模型 + 缓存 + 多语言 + 批量导出）
-# 依赖：streamlit pandas numpy scikit-learn joblib imbalanced-learn lightgbm catboost skops requests
-# 建议 Python 3.11（Streamlit Cloud 用 runtime.txt: python-3.11.9）
+# 依赖：streamlit pandas numpy scikit-learn joblib imbalanced-learn lightgbm catboost skops requests packaging
+# 建议 Python 3.11（在根目录 runtime.txt: python-3.11.9）
 
-import json, io, os, hashlib, tempfile, shutil, time
+import json, io, os, hashlib, tempfile, shutil
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from packaging.version import Version
 
 # =========================
 # 0) 多语言文本
@@ -62,7 +63,7 @@ TEXT = {
     "verifying": {"zh": "校验文件完整性…", "en": "Verifying file integrity…"},
     "merging": {"zh": "合并分片…", "en": "Merging parts…"},
     "cached": {"zh": "已命中缓存，跳过下载。", "en": "Cache hit, skip download."},
-    "skops_fail": {"zh": "读取 SKOPS 失败，将回退到 joblib：", "en": "SKOPS load failed, fallback to joblib: "},
+    "skops_fail": {"zh": "读取 SKOPS 失败：", "en": "SKOPS load failed: "},
     "joblib_fail": {"zh": "加载 joblib 模型失败：", "en": "Load joblib failed: "},
 }
 
@@ -83,7 +84,6 @@ ROOT = Path(__file__).parent
 CACHE_DIR = ROOT / ".model_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
-# 本地优先文件名（如仓库里已经带 skops/joblib 则直接用，优先 skops）
 LOCAL_SKOPS = ROOT / "final_pipeline.skops"
 LOCAL_JOBLIB = ROOT / "final_pipeline.joblib"
 
@@ -91,7 +91,6 @@ SCHEMA_PATH = ROOT / "feature_schema.json"
 THR_PATH = ROOT / "thresholds.json"
 META_PATH = ROOT / "release_meta.json"
 
-# 可选：字段显示映射（键=特征列名）
 DISPLAY = {
     "alb":  {"zh": "白蛋白 (ALB, g/L)",           "en": "Albumin (ALB, g/L)"},
     "ldh":  {"zh": "乳酸脱氢酶 (LDH, U/L)",        "en": "Lactate Dehydrogenase (LDH, U/L)"},
@@ -112,7 +111,6 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 def download_one(url: str, dst: Path, progress: Optional[st.delta_generator.DeltaGenerator]=None) -> None:
-    # 简单流式下载（支持 http(s) 直链）
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", 0))
@@ -131,11 +129,8 @@ def merge_files(parts: List[Path], dst: Path) -> None:
             with p.open("rb") as f:
                 shutil.copyfileobj(f, out)
 
-def get_urls_from_secrets_or_env() -> (List[str], Optional[str]):
-    """从 st.secrets / 环境变量读取 MODEL_URL(S) 与可选的 MODEL_SHA256"""
-    urls = []
-    sha = None
-    # 优先 secrets
+def get_urls_from_secrets_or_env() -> Tuple[List[str], Optional[str]]:
+    urls, sha = [], None
     try:
         if "MODEL_URLS" in st.secrets:
             urls = [u.strip() for u in str(st.secrets["MODEL_URLS"]).strip().splitlines() if u.strip()]
@@ -145,28 +140,19 @@ def get_urls_from_secrets_or_env() -> (List[str], Optional[str]):
             sha = str(st.secrets["MODEL_SHA256"]).strip().lower()
     except Exception:
         pass
-    # 回退环境变量
     if not urls:
         env_urls = os.environ.get("MODEL_URLS") or os.environ.get("MODEL_URL") or ""
         if env_urls.strip():
-            # 兼容逗号/换行
             if "\n" in env_urls:
                 urls = [u.strip() for u in env_urls.strip().splitlines() if u.strip()]
             else:
                 urls = [u.strip() for u in env_urls.split(",") if u.strip()]
     if sha is None:
-        sha = os.environ.get("MODEL_SHA256", None)
-        if sha:
-            sha = sha.strip().lower()
+        sha = (os.environ.get("MODEL_SHA256") or "").strip().lower() or None
     return urls, sha
 
 def ensure_model_file() -> Path:
-    """
-    返回可用的模型文件路径：
-    - 如果本地有 final_pipeline.skops，直接使用
-    - 否则如果本地有 joblib（且你愿意承担版本不一致风险），也可用
-    - 否则读取 MODEL_URL(S) 下载到缓存（单文件或分片），合并并校验 SHA256（若提供）
-    """
+    # 本地优先
     if LOCAL_SKOPS.exists():
         return LOCAL_SKOPS
     if LOCAL_JOBLIB.exists():
@@ -177,33 +163,32 @@ def ensure_model_file() -> Path:
         st.error(TEXT["model_missing"][LANG])
         st.stop()
 
-    is_multipart = len(urls) > 1
     target = CACHE_DIR / "final_pipeline.skops"
-    # 如果已有且（若提供 SHA）校验通过，直接复用
+    # 命中缓存
     if target.exists() and (not sha or sha256_file(target) == sha):
         st.info(TEXT["cached"][LANG])
         return target
 
     # 下载
-    if is_multipart:
+    if len(urls) > 1:
         st.info(TEXT["downloading"][LANG])
         tmp_dir = Path(tempfile.mkdtemp())
-        part_paths = []
+        parts = []
         for i, url in enumerate(urls):
             st.write(f"Part {i+1}/{len(urls)}")
-            part_path = tmp_dir / f"part_{i:03d}"
             bar = st.progress(0.0)
-            download_one(url, part_path, progress=bar)
-            part_paths.append(part_path)
+            p = tmp_dir / f"part_{i:03d}"
+            download_one(url, p, progress=bar)
+            parts.append(p)
         st.info(TEXT["merging"][LANG])
-        merge_files(part_paths, target)
+        merge_files(parts, target)
         shutil.rmtree(tmp_dir, ignore_errors=True)
     else:
         st.info(TEXT["downloading"][LANG])
         bar = st.progress(0.0)
-        download_one(urls[0], target.with_suffix(".down"), progress=bar)
-        target_tmp = target.with_suffix(".down")
-        target_tmp.replace(target)
+        tmp = target.with_suffix(".down")
+        download_one(urls[0], tmp, progress=bar)
+        tmp.replace(target)
 
     # 校验
     if sha:
@@ -211,42 +196,72 @@ def ensure_model_file() -> Path:
         got = sha256_file(target)
         if got.lower() != sha.lower():
             target.unlink(missing_ok=True)
-            st.error(
-                (TEXT["read_fail"][LANG] if LANG == "zh" else TEXT["read_fail"][LANG])
-                + f"SHA256 mismatch. expected={sha}, got={got}"
-            )
+            st.error(TEXT["read_fail"][LANG] + f"SHA256 mismatch. expected={sha}, got={got}")
             st.stop()
 
     return target
 
+# =============== SKOPS 安全加载（兼容 0.10+） ===============
+def safe_skops_load(path: Path):
+    import skops, skops.io as sio
+    ver = Version(skops.__version__)
+    # 允许用户通过 Secrets/ENV 自定义信任前缀（逗号分隔）
+    default_prefixes = ("sklearn.", "numpy.", "scipy.", "lightgbm", "catboost", "xgboost", "skops.")
+    allow_env = (st.secrets.get("SKOPS_ALLOWED_PREFIXES", None)
+                 if hasattr(st, "secrets") else None) or os.environ.get("SKOPS_ALLOWED_PREFIXES", "")
+    if allow_env.strip():
+        prefixes = tuple([p.strip() for p in allow_env.split(",") if p.strip()])
+    else:
+        prefixes = default_prefixes
+
+    trust_all = (str(st.secrets.get("SKOPS_TRUST_ALL", ""))
+                 if hasattr(st, "secrets") else os.environ.get("SKOPS_TRUST_ALL", "")) \
+                 .strip().lower() in {"1", "true", "yes"}
+
+    # 0.10 之前：仍接受 bool
+    if ver < Version("0.10"):
+        return sio.load(path, trusted=True)
+
+    # 0.10 及以上：必须传字符串列表
+    untrusted = sio.get_untrusted_types(path)
+
+    if trust_all:
+        trusted = untrusted
+    else:
+        trusted = [t for t in untrusted if any(t.startswith(pref) for pref in prefixes)]
+
+    with st.expander("SKOPS 安全审计 / Trusted types", expanded=False):
+        st.write("发现的类型（untrusted types）:", untrusted)
+        st.write("将被信任并加载的类型（trusted）:", trusted)
+        if not trust_all and len(trusted) != len(untrusted):
+            st.info("提示：如需一次全信任，可在 Secrets/ENV 设 SKOPS_TRUST_ALL=1；或扩大 SKOPS_ALLOWED_PREFIXES。")
+
+    return sio.load(path, trusted=trusted)
+
 # =============== 载入资产（模型 + schema/阈值/元信息） ===============
 @st.cache_resource
 def load_assets():
-    # 确保有模型：优先本地，否则远程下载到缓存
     model_path = ensure_model_file()
 
-    # 先尝试 SKOPS，再回退 joblib
     pipe = None
-    if model_path.suffix == ".skops":
-        try:
-            import skops.io as sio
-            pipe = sio.load(model_path, trusted=True)
-        except Exception as e:
-            st.warning(TEXT["skops_fail"][LANG] + str(e))
+    suffix = model_path.suffix.lower()
 
-    if pipe is None:
+    if suffix == ".skops":
+        try:
+            pipe = safe_skops_load(model_path)
+        except Exception as e:
+            st.error(TEXT["skops_fail"][LANG] + str(e))
+            st.stop()
+
+    elif suffix in {".joblib", ".pkl", ".pickle"}:
         try:
             pipe = joblib.load(model_path)
-        except ModuleNotFoundError as e:
-            st.error(
-                "无法通过 joblib 加载模型，通常是因为训练时的自定义模块/路径在云端不存在。\n"
-                "优先使用 SKOPS（final_pipeline.skops），或把自定义类/函数随应用一起打包。\n"
-                f"原始错误：{e}"
-            )
-            st.stop()
         except Exception as e:
             st.error(TEXT["joblib_fail"][LANG] + str(e))
             st.stop()
+    else:
+        st.error(TEXT["read_fail"][LANG] + f"Unsupported model file: {model_path.name}")
+        st.stop()
 
     # 读取 schema / 阈值 / 元信息
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -451,13 +466,13 @@ td,th{{border:1px solid #ddd;padding:6px 8px;}} .ok{{color:#0b8a00;}} .bad{{colo
 
 # =============== 批量 CSV 预测 + 风险句子 ===============
 st.markdown(f"### {TEXT['batch_title'][LANG]}")
-st.caption(TEXT["batch_caption"][LANG])
+st.caption(TEXT["batch_caption"][LANG]")
 up = st.file_uploader(TEXT["upload_csv"][LANG], type=["csv"], accept_multiple_files=False)
 
 if up is not None:
     try:
         df_in = pd.read_csv(up)
-        X = df_in.reindex(columns=order)  # 缺列→全缺失列，交由管道处理
+        X = df_in.reindex(columns=order)
         p = pipe.predict_proba(X)[:, 1]
         out = df_in.copy()
         out["prob"] = p
