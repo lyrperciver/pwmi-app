@@ -1,0 +1,94 @@
+{
+  "features": [
+    {
+      "name": "alb",
+      "dtype": "float",
+      "unit": "",
+      "allowed_range": [
+        null,
+        null
+      ],
+      "missing_strategy": "SimpleImputer(median)"
+    },
+    {
+      "name": "ldh",
+      "dtype": "float",
+      "unit": "",
+      "allowed_range": [
+        null,
+        null
+      ],
+      "missing_strategy": "SimpleImputer(median)"
+    },
+    {
+      "name": "apgar_1min",
+      "dtype": "float",
+      "unit": "",
+      "allowed_range": [
+        null,
+        null
+      ],
+      "missing_strategy": "SimpleImputer(median)"
+    },
+    {
+      "name": "hbdh",
+      "dtype": "float",
+      "unit": "",
+      "allowed_range": [
+        null,
+        null
+      ],
+      "missing_strategy": "SimpleImputer(median)"
+    },
+    {
+      "name": "aop",
+      "dtype": "float",
+      "unit": "",
+      "allowed_range": [
+        null,
+        null
+      ],
+      "missing_strategy": "SimpleImputer(median)"
+    },
+    {
+      "name": "inv_vent_days",
+      "dtype": "float",
+      "unit": "",
+      "allowed_range": [
+        null,
+        null
+      ],
+      "missing_strategy": "SimpleImputer(median)"
+    },
+    {
+      "name": "seizure",
+      "dtype": "float",
+      "unit": "",
+      "allowed_range": [
+        null,
+        null
+      ],
+      "missing_strategy": "SimpleImputer(median)"
+    },
+    {
+      "name": "birth_weight_g",
+      "dtype": "float",
+      "unit": "",
+      "allowed_range": [
+        null,
+        null
+      ],
+      "missing_strategy": "SimpleImputer(median)"
+    }
+  ],
+  "order": [
+    "alb",
+    "ldh",
+    "apgar_1min",
+    "hbdh",
+    "aop",
+    "inv_vent_days",
+    "seizure",
+    "birth_weight_g"
+  ]
+}
