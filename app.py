@@ -1,20 +1,23 @@
-# app.py — PWMI 预测原型（远程下载模型 + 缓存 + 多语言 + 批量导出）
-# 依赖：streamlit pandas numpy scikit-learn joblib imbalanced-learn lightgbm catboost skops requests packaging
-# 建议 Python 3.11（在根目录 runtime.txt: python-3.11.9）
+# app.py — PWMI 预测原型（多语言 + 字段提示 + 风险等级/句子 + 批量导出 + 远程模型下载缓存）
+# 依赖（requirements.txt 建议）:
+# streamlit==1.38.0
+# pandas==2.2.3
+# numpy==1.26.4
+# scikit-learn==1.3.2
+# joblib==1.3.2
+# requests==2.32.5
+# skops==0.13.0  # 重要：>=0.10 的“trusted”需要传入字符串列表
 
-import json, io, os, hashlib, tempfile, shutil
+import io, os, json, hashlib, tempfile, shutil
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
-from packaging.version import Version
 
 # =========================
-# 0) 多语言文本
+# 1) 多语言文本（可自行扩展）
 # =========================
 TEXT = {
     "lang_label": {"zh": "界面语言", "en": "Interface language"},
@@ -55,19 +58,24 @@ TEXT = {
     },
     "read_fail": {"zh": "读取或预测失败：", "en": "Read / prediction failed: "},
     "done_n": {"zh": "预测完成：{n} 条", "en": "Done: {n} rows"},
-    "model_missing": {
-        "zh": "未找到本地模型，也未配置远程下载地址。请在 Secrets 中设置 MODEL_URL 或 MODEL_URLS。",
-        "en": "No local model and no remote URL configured. Please set MODEL_URL or MODEL_URLS in Secrets.",
+    "skops_warn": {
+        "zh": "安全提示：已根据 skops>=0.10 的要求使用 get_untrusted_types(file=...) 获取受信类型列表进行加载。",
+        "en": "Security note: Using get_untrusted_types(file=...) per skops>=0.10 to build trusted list.",
     },
-    "downloading": {"zh": "下载模型文件…", "en": "Downloading model file…"},
-    "verifying": {"zh": "校验文件完整性…", "en": "Verifying file integrity…"},
-    "merging": {"zh": "合并分片…", "en": "Merging parts…"},
-    "cached": {"zh": "已命中缓存，跳过下载。", "en": "Cache hit, skip download."},
-    "skops_fail": {"zh": "读取 SKOPS 失败：", "en": "SKOPS load failed: "},
-    "joblib_fail": {"zh": "加载 joblib 模型失败：", "en": "Load joblib failed: "},
+    "dl_cached": {"zh": "已命中缓存，跳过下载。", "en": "Cache hit; skipping download."},
+    "dl_ok": {"zh": "模型已下载并缓存：", "en": "Model downloaded and cached:"},
+    "dl_join": {"zh": "检测到分片，正在拼接……", "en": "Detected parts; joining…"},
+    "sha_ok": {"zh": "SHA256 校验通过。", "en": "SHA256 verified."},
+    "sha_bad": {"zh": "SHA256 校验失败（已删除）。", "en": "SHA256 mismatch (deleted)."},
+    "no_model": {
+        "zh": "未找到模型：请提供本地 final_pipeline.skops/joblib，或设置环境变量 MODEL_URL / MODEL_URLS。",
+        "en": "Model not found: provide local final_pipeline.skops/joblib or set env MODEL_URL / MODEL_URLS.",
+    },
 }
 
-# =============== 语言选择 ===============
+# ===============
+# 2) 语言选择
+# ===============
 st.set_page_config(page_title=TEXT["title"]["zh"], layout="centered")
 lang_choice = st.sidebar.radio(
     f'{TEXT["lang_label"]["zh"]} / {TEXT["lang_label"]["en"]}',
@@ -76,21 +84,25 @@ lang_choice = st.sidebar.radio(
     horizontal=True,
 )
 LANG = "zh" if lang_choice == "中文" else "en"
+# 更新标题
 st.title(TEXT["title"][LANG])
 st.caption(TEXT["caption"][LANG])
 
-# =============== 常量与路径 ===============
+# =============================
+# 3) 路径与发布物
+# =============================
 ROOT = Path(__file__).parent
+PIPE_PATH = ROOT / "final_pipeline.joblib"
+SKOPS_PATH = ROOT / "final_pipeline.skops"
 CACHE_DIR = ROOT / ".model_cache"
 CACHE_DIR.mkdir(exist_ok=True)
-
-LOCAL_SKOPS = ROOT / "final_pipeline.skops"
-LOCAL_JOBLIB = ROOT / "final_pipeline.joblib"
+CACHE_SKOPS = CACHE_DIR / "final_pipeline.skops"
 
 SCHEMA_PATH = ROOT / "feature_schema.json"
 THR_PATH = ROOT / "thresholds.json"
 META_PATH = ROOT / "release_meta.json"
 
+# 可选：字段显示映射（键=特征列名）
 DISPLAY = {
     "alb":  {"zh": "白蛋白 (ALB, g/L)",           "en": "Albumin (ALB, g/L)"},
     "ldh":  {"zh": "乳酸脱氢酶 (LDH, U/L)",        "en": "Lactate Dehydrogenase (LDH, U/L)"},
@@ -102,170 +114,173 @@ DISPLAY = {
     "birth_weight_g": {"zh": "出生体重 (g)",       "en": "Birth weight (g)"},
 }
 
-# =============== 工具：下载 & 校验 ===============
-def sha256_file(path: Path) -> str:
+# =============================
+# 4) 下载/合并/校验工具
+# =============================
+def sha256_of(path: Path) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as f:
+    with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
 
-def download_one(url: str, dst: Path, progress=None) -> None:
+def stream_download(url: str, dest: Path):
+    import requests
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0))
-        got = 0
-        with dst.open("wb") as f:
+        with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
-                    got += len(chunk)
-                    if progress and total:
-                        progress.progress(min(1.0, got / total))
 
-def merge_files(parts: List[Path], dst: Path) -> None:
-    with dst.open("wb") as out:
-        for p in parts:
-            with p.open("rb") as f:
-                shutil.copyfileobj(f, out)
+def ensure_model_local() -> Path:
+    """返回本地可用的 .skops 路径；按顺序：本地 → 缓存 → 远程下载"""
+    # 1) 本地同目录
+    if SKOPS_PATH.exists():
+        return SKOPS_PATH
+    # 2) 缓存目录
+    if CACHE_SKOPS.exists():
+        return CACHE_SKOPS
 
-def get_urls_from_secrets_or_env() -> Tuple[List[str], Optional[str]]:
-    urls, sha = [], None
-    try:
-        if "MODEL_URLS" in st.secrets:
-            urls = [u.strip() for u in str(st.secrets["MODEL_URLS"]).strip().splitlines() if u.strip()]
-        elif "MODEL_URL" in st.secrets:
-            urls = [str(st.secrets["MODEL_URL"]).strip()]
-        if "MODEL_SHA256" in st.secrets:
-            sha = str(st.secrets["MODEL_SHA256"]).strip().lower()
-    except Exception:
-        pass
-    if not urls:
-        env_urls = os.environ.get("MODEL_URLS") or os.environ.get("MODEL_URL") or ""
-        if env_urls.strip():
-            if "\n" in env_urls:
-                urls = [u.strip() for u in env_urls.strip().splitlines() if u.strip()]
-            else:
-                urls = [u.strip() for u in env_urls.split(",") if u.strip()]
-    if sha is None:
-        sha = (os.environ.get("MODEL_SHA256") or "").strip().lower() or None
-    return urls, sha
+    # 3) 远程下载（单 URL 或多分片）
+    urls = os.getenv("MODEL_URLS") or ""
+    url = os.getenv("MODEL_URL") or ""
+    sha_expect = (os.getenv("MODEL_SHA256") or "").lower().strip()
 
-def ensure_model_file() -> Path:
-    # 本地优先
-    if LOCAL_SKOPS.exists():
-        return LOCAL_SKOPS
-    if LOCAL_JOBLIB.exists():
-        return LOCAL_JOBLIB
-
-    urls, sha = get_urls_from_secrets_or_env()
-    if not urls:
-        st.error(TEXT["model_missing"][LANG])
-        st.stop()
-
-    target = CACHE_DIR / "final_pipeline.skops"
-    # 命中缓存
-    if target.exists() and (not sha or sha256_file(target) == sha):
-        st.info(TEXT["cached"][LANG])
-        return target
-
-    # 下载
-    if len(urls) > 1:
-        st.info(TEXT["downloading"][LANG])
-        tmp_dir = Path(tempfile.mkdtemp())
-        parts = []
-        for i, url in enumerate(urls):
-            st.write(f"Part {i+1}/{len(urls)}")
-            bar = st.progress(0.0)
-            p = tmp_dir / f"part_{i:03d}"
-            download_one(url, p, progress=bar)
-            parts.append(p)
-        st.info(TEXT["merging"][LANG])
-        merge_files(parts, target)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    if urls.strip():
+        parts = [u.strip() for u in urls.split(",") if u.strip()]
+        if len(parts) == 1:
+            # 只有一个也当成整包
+            st.info("MODEL_URLS（单个）→ 按整包下载")
+            with st.spinner("Downloading model…"):
+                stream_download(parts[0], CACHE_SKOPS)
+        else:
+            # 多个分片，按顺序拼接
+            st.info(TEXT["dl_join"][LANG])
+            with tempfile.TemporaryDirectory() as td:
+                td = Path(td)
+                tmps = []
+                for i, u in enumerate(parts):
+                    tmp = td / f"part_{i:02d}.bin"
+                    with st.spinner(f"Downloading part {i+1}/{len(parts)} …"):
+                        stream_download(u, tmp)
+                    tmps.append(tmp)
+                # 拼接
+                with open(CACHE_SKOPS, "wb") as out:
+                    for p in tmps:
+                        with open(p, "rb") as f:
+                            shutil.copyfileobj(f, out)
+    elif url.strip():
+        with st.spinner("Downloading model…"):
+            stream_download(url.strip(), CACHE_SKOPS)
     else:
-        st.info(TEXT["downloading"][LANG])
-        bar = st.progress(0.0)
-        tmp = target.with_suffix(".down")
-        download_one(urls[0], tmp, progress=bar)
-        tmp.replace(target)
+        return None
 
     # 校验
-    if sha:
-        st.info(TEXT["verifying"][LANG])
-        got = sha256_file(target)
-        if got.lower() != sha.lower():
-            target.unlink(missing_ok=True)
-            st.error(TEXT["read_fail"][LANG] + f"SHA256 mismatch. expected={sha}, got={got}")
-            st.stop()
+    if sha_expect:
+        got = sha256_of(CACHE_SKOPS)
+        if got == sha_expect:
+            st.success(TEXT["sha_ok"][LANG] + f" ({got[:12]}…)")
+        else:
+            st.error(TEXT["sha_bad"][LANG] + f" expect={sha_expect[:12]}… got={got[:12]}…")
+            try:
+                CACHE_SKOPS.unlink()
+            except Exception:
+                pass
+            return None
 
-    return target
+    st.success(TEXT["dl_ok"][LANG] + f" {CACHE_SKOPS.name}")
+    return CACHE_SKOPS if CACHE_SKOPS.exists() else None
 
-# =============== SKOPS 安全加载（兼容 0.10+） ===============
-def safe_skops_load(path: Path):
-    import skops, skops.io as sio
-    ver = Version(skops.__version__)
-    default_prefixes = ("sklearn.", "numpy.", "scipy.", "lightgbm", "catboost", "xgboost", "skops.")
-    allow_env = (st.secrets.get("SKOPS_ALLOWED_PREFIXES", None)
-                 if hasattr(st, "secrets") else None) or os.environ.get("SKOPS_ALLOWED_PREFIXES", "")
-    if allow_env.strip():
-        prefixes = tuple([p.strip() for p in allow_env.split(",") if p.strip()])
-    else:
-        prefixes = default_prefixes
-
-    trust_all = (str(st.secrets.get("SKOPS_TRUST_ALL", ""))
-                 if hasattr(st, "secrets") else os.environ.get("SKOPS_TRUST_ALL", "")) \
-                 .strip().lower() in {"1", "true", "yes"}
-
-    if ver < Version("0.10"):
-        return sio.load(path, trusted=True)
-
-    untrusted = sio.get_untrusted_types(path)
-
-    if trust_all:
-        trusted = untrusted
-    else:
-        trusted = [t for t in untrusted if any(t.startswith(pref) for pref in prefixes)]
-
-    with st.expander("SKOPS 安全审计 / Trusted types", expanded=False):
-        st.write("发现的类型（untrusted types）:", untrusted)
-        st.write("将被信任并加载的类型（trusted）:", trusted)
-        if not trust_all and len(trusted) != len(untrusted):
-            st.info("提示：如需一次全信任，可在 Secrets/ENV 设 SKOPS_TRUST_ALL=1；或扩大 SKOPS_ALLOWED_PREFIXES。")
-
-    return sio.load(path, trusted=trusted)
-
-# =============== 载入资产（模型 + schema/阈值/元信息） ===============
+# ===========================
+# 5) 载入资产（缓存）
+# ===========================
 @st.cache_resource
 def load_assets():
-    model_path = ensure_model_file()
+    # 1) 确定模型路径
+    model_path = None
+    if (ROOT / "final_pipeline.skops").exists():
+        model_path = ROOT / "final_pipeline.skops"
+    else:
+        candidate = ensure_model_local()
+        if candidate:
+            model_path = candidate
 
     pipe = None
-    suffix = model_path.suffix.lower()
 
-    if suffix == ".skops":
+    # 2) 优先 SKOPS（新版 trusted 需要列表；我们通过 get_untrusted_types(**kw) 获取）
+    if model_path and model_path.suffix.lower() == ".skops":
         try:
-            pipe = safe_skops_load(model_path)
+            import skops.io as sio, inspect
+            # skops>=0.10: get_untrusted_types 需要用关键字参数（不同版本名不同，这里做兼容）
+            try:
+                sig = inspect.signature(sio.get_untrusted_types)
+                params = sig.parameters
+                kwargs = {}
+                for name in ("file", "path", "filename", "fname", "source"):
+                    if name in params:
+                        kwargs[name] = str(model_path)
+                        break
+                if not kwargs:
+                    # 有些版本允许位置参数；但若不支持会抛 TypeError（外层会捕获并提示）
+                    trusted = sio.get_untrusted_types(str(model_path))
+                else:
+                    trusted = sio.get_untrusted_types(**kwargs)
+            except TypeError as te:
+                # 当出现 “takes 0 positional arguments but 1 was given” 时，强制用关键字 file=
+                try:
+                    trusted = sio.get_untrusted_types(file=str(model_path))
+                except Exception as e2:
+                    raise e2
+            except AttributeError:
+                # 非 0.10+ 的旧版 skops（很少见），退回布尔 trusted（仅供自控环境用）
+                trusted = True  # 仅在旧版 skops 可用
+
+            # 允许通过白名单前缀过滤（可选）
+            if isinstance(trusted, list):
+                allow_prefix = os.getenv("SKOPS_ALLOWED_PREFIXES", "")
+                if allow_prefix:
+                    prefixes = [p.strip() for p in allow_prefix.split(",") if p.strip()]
+                    trusted = [t for t in trusted if any(t.startswith(p) for p in prefixes)]
+
+            pipe = sio.load(str(model_path), trusted=trusted)
+            st.info(TEXT["skops_warn"][LANG])
         except Exception as e:
-            st.error(TEXT["skops_fail"][LANG] + str(e))
+            st.warning(f"读取 SKOPS 失败，将回退到 joblib：{e}")
+
+    # 3) 回退到 joblib（如有）
+    if pipe is None:
+        if not PIPE_PATH.exists():
+            if not model_path:
+                st.error(TEXT["no_model"][LANG])
+            else:
+                st.error(f"无法读取模型文件：{model_path}")
+            st.stop()
+        try:
+            pipe = joblib.load(PIPE_PATH)
+        except ModuleNotFoundError as e:
+            st.error(
+                "无法通过 joblib 加载模型，通常是因为训练时的自定义模块/路径在云端不存在。\n"
+                "解决方案之一：在本地把模型导出为 SKOPS 格式（如 final_pipeline.skops）并上传/远程托管；"
+                "或将模型中用到的自定义类/函数随应用一起打包。"
+                f"\n原始错误：{e}"
+            )
+            st.stop()
+        except Exception as e:
+            st.error(f"加载 joblib 模型失败：{e}")
             st.stop()
 
-    elif suffix in {".joblib", ".pkl", ".pickle"}:
-        try:
-            pipe = joblib.load(model_path)
-        except Exception as e:
-            st.error(TEXT["joblib_fail"][LANG] + str(e))
-            st.stop()
-    else:
-        st.error(TEXT["read_fail"][LANG] + f"Unsupported model file: {model_path.name}")
+    # 4) 读取 schema / 阈值 / 元信息
+    if not SCHEMA_PATH.exists():
+        st.error(f"缺少 {SCHEMA_PATH.name}")
+        st.stop()
+    if not THR_PATH.exists():
+        st.error(f"缺少 {THR_PATH.name}")
         st.stop()
 
-    # 读取 schema / 阈值 / 元信息
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     order = schema.get("order") or [d["name"] for d in schema["features"]]
-    feat_defs = schema.get("features") or [
-        {"name": n, "dtype": "float", "allowed_range": [None, None]} for n in order
-    ]
+    feat_defs = schema.get("features") or [{"name": n, "dtype": "float", "allowed_range": [None, None]} for n in order]
     defs_by_name = {d["name"]: d for d in feat_defs}
 
     thr = json.loads(THR_PATH.read_text(encoding="utf-8"))
@@ -294,25 +309,35 @@ pipe, order, featdefs, thrs, meta = load_assets()
 with st.expander(TEXT["meta"][LANG], expanded=False):
     st.json(meta or {"note": "N/A"})
 
-# =============== 工具：二元识别 / 标签与提示 ===============
+# =====================================
+# 6) 工具函数：二元识别 / 标签与提示（大小写无关）
+# =====================================
+
+# ① 大小写无关的显示映射：把 DISPLAY 的 key 全部转成小写做查找
 DISPLAY_CI = {k.lower(): v for k, v in DISPLAY.items()}
+
+# ② 常见的二元变量名称（全小写）；可按需增删
 BINARY_FEATURES = {
     "seizure", "aop", "pda", "bpd", "rds",
     "ivh", "sepsis", "asphyxia", "hypoglycemia",
     "hypocalcemia", "phototherapy", "steroids",
     "ventilation", "invasive_vent", "inv_vent", "cpap",
+    # 以 _flag/_bin 结尾的也按二元处理（见 is_binary_name）
 }
+# 明确是“天数/小时数”的不要放进来（如 inv_vent_days）
 
 def is_binary_name(name: str) -> bool:
     n = str(name).lower()
     if n in BINARY_FEATURES:
         return True
+    # 变量名以这些后缀结尾，也视为二元
     for suf in ("_flag", "_bin", "_binary"):
         if n.endswith(suf):
             return True
     return False
 
 def is_binary_def(defn: dict, name: str) -> bool:
+    """多策略判断是否二元：dtype/allowed_range/变量名启发式"""
     dtype = str(defn.get("dtype", "")).lower()
     if dtype == "binary":
         return True
@@ -324,16 +349,19 @@ def is_binary_def(defn: dict, name: str) -> bool:
                 return True
         except Exception:
             pass
+    # 最后用名称启发式
     return is_binary_name(name)
 
 def label_for(name: str, defn: dict) -> str:
+    """按 DISPLAY（大小写无关） → 否则用 列名(+单位)"""
     unit = defn.get("unit") or ""
     mapped = DISPLAY_CI.get(str(name).lower(), {}).get(LANG)
     if mapped:
-        return mapped
+        return mapped  # 已含单位
     return f"{name} ({unit})" if unit else str(name)
 
 def help_for(defn: dict, is_bin: bool) -> str:
+    """生成 tooltip：范围/步进 + 二元说明"""
     lo, hi = (defn.get("allowed_range") or [None, None])
     step = defn.get("step", 1 if is_bin else 0.1)
     bits = []
@@ -344,7 +372,9 @@ def help_for(defn: dict, is_bin: bool) -> str:
         bits.append(TEXT["binary_help"][LANG])
     return " · ".join(bits)
 
-# =============== 表单输入 ===============
+# ===========================
+# 7) 表单输入（带提示/二元下拉）
+# ===========================
 st.markdown(f"### {TEXT['input_section'][LANG]}")
 cols = st.columns(2)
 values = {}
@@ -358,11 +388,13 @@ for i, name in enumerate(order):
 
     with cols[i % 2]:
         if is_bin:
+            # 二元变量：用下拉 0/1，既有 tooltip，也在控件下方再写一遍文字提示
             values[name] = st.selectbox(
                 lbl, options=[0, 1], index=0, help=help_text, key=f"bin_{name}"
             )
             st.caption(TEXT["binary_help"][LANG])
         else:
+            # 数值变量：默认值 = 范围中点，否则 0.0
             if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
                 default = (float(lo) + float(hi)) / 2.0
                 step = float(d.get("step", 0.1))
@@ -384,6 +416,7 @@ for i, name in enumerate(order):
                     help=help_text,
                 )
 
+# —— 7.5) 阈值策略 + 预测按钮 ——
 st.divider()
 mode = st.radio(
     TEXT["thresh_mode"][LANG],
@@ -392,10 +425,13 @@ mode = st.radio(
 )
 btn_predict = st.button(TEXT["predict"][LANG], type="primary")
 
-# =============== 风险分级规则（两阈值） ===============
+# ===========================
+# 8) 风险分级规则（基于两阈值）
+# ===========================
 def pick_thresholds(thrs_dict):
     t_youden = thrs_dict.get("youden")
     t_hsens = thrs_dict.get("highs")
+    # 缺失兜底
     if t_youden is None:
         t_youden = 0.5
     if t_hsens is None:
@@ -413,7 +449,9 @@ def risk_bucket(p: float, lang="zh") -> str:
     else:
         return TEXT["risk_high"][lang]
 
-# =============== 单例预测 ===============
+# ===========================
+# 9) 单例预测
+# ===========================
 if btn_predict:
     x = pd.DataFrame([values])[order]
     p = float(pipe.predict_proba(x)[:, 1][0])
@@ -428,9 +466,11 @@ if btn_predict:
     final_label = label_youden if mode == TEXT["youd"][LANG] else label_highs
     st.success(f"{TEXT['current_mode'][LANG]}：**{mode}** → {TEXT['result'][LANG]}：**{TEXT['pos'][LANG] if final_label else TEXT['neg'][LANG]}**")
 
+    # 风险等级句子（显示 + 报告写入）
     risk_sent = TEXT["risk_sentence"][LANG].format(level=risk_bucket(p, LANG), p=p)
     st.write(risk_sent)
 
+    # HTML 报告
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>PWMI Report</title>
 <style>
@@ -461,7 +501,9 @@ td,th{{border:1px solid #ddd;padding:6px 8px;}} .ok{{color:#0b8a00;}} .bad{{colo
     st.download_button(TEXT["download_html"][LANG], data=html.encode("utf-8"),
                        file_name="pwmi_report.html", mime="text/html")
 
-# =============== 批量 CSV 预测 + 风险句子 ===============
+# ===========================
+# 10) 批量 CSV 预测 + 风险句子
+# ===========================
 st.markdown(f"### {TEXT['batch_title'][LANG]}")
 st.caption(TEXT["batch_caption"][LANG])
 up = st.file_uploader(TEXT["upload_csv"][LANG], type=["csv"], accept_multiple_files=False)
@@ -469,12 +511,13 @@ up = st.file_uploader(TEXT["upload_csv"][LANG], type=["csv"], accept_multiple_fi
 if up is not None:
     try:
         df_in = pd.read_csv(up)
-        X = df_in.reindex(columns=order)
+        X = df_in.reindex(columns=order)  # 缺列→全缺失列，交由管道处理
         p = pipe.predict_proba(X)[:, 1]
         out = df_in.copy()
         out["prob"] = p
         out["label_youden"] = (p >= t_youden).astype(int)
         out["label_highsens"] = (p >= t_hsens).astype(int)
+        # 风险等级 + 句子（中英文）
         out["risk_level_zh"] = [risk_bucket(float(x), "zh") for x in p]
         out["risk_level_en"] = [risk_bucket(float(x), "en") for x in p]
         out["summary_zh"] = [TEXT["risk_sentence"]["zh"].format(level=risk_bucket(float(x), "zh"), p=float(x)) for x in p]
