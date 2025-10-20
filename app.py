@@ -1,4 +1,4 @@
-# app.py — PWMI 预测原型（多语言 + 字段提示 + 风险等级/句子 + 批量导出 + 远程模型下载缓存）
+# app.py — PBI 预测原型（多语言 + 字段提示 + 风险等级/句子 + 批量导出 + 远程模型下载缓存）
 # 依赖（requirements.txt 建议）:
 # streamlit==1.38.0
 # pandas==2.2.3
@@ -21,7 +21,7 @@ import streamlit as st
 # =========================
 TEXT = {
     "lang_label": {"zh": "界面语言", "en": "Interface language"},
-    "title": {"zh": "PWMI 风险预测 · 原型（研究性）", "en": "PWMI Risk Prediction · Prototype"},
+    "title": {"zh": "PBI 风险预测 · 原型（研究性）", "en": "PBI Risk Prediction · Prototype"},
     "caption": {
         "zh": "说明：本工具仅用于科研/质控，不构成临床诊断依据。",
         "en": "Note: Research/QC only. Not for clinical diagnosis.",
@@ -472,7 +472,7 @@ if btn_predict:
 
     # HTML 报告
     html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>PWMI Report</title>
+<html><head><meta charset="utf-8"><title>PBI Report</title>
 <style>
 body{{font-family:Arial,Helvetica,sans-serif;max-width:900px;margin:24px auto;}}
 h1{{font-size:22px;}} table{{border-collapse:collapse;width:100%;}}
@@ -499,7 +499,7 @@ td,th{{border:1px solid #ddd;padding:6px 8px;}} .ok{{color:#0b8a00;}} .bad{{colo
 <p class="small">{TEXT['caption'][LANG]}</p>
 </body></html>"""
     st.download_button(TEXT["download_html"][LANG], data=html.encode("utf-8"),
-                       file_name="pwmi_report.html", mime="text/html")
+                       file_name="pbi_report.html", mime="text/html")
 
 # ===========================
 # 10) 批量 CSV 预测 + 风险句子
@@ -530,11 +530,12 @@ if up is not None:
         out.to_csv(buf, index=False, encoding="utf-8-sig")
         st.download_button(TEXT["download_csv"][LANG],
                            data=buf.getvalue().encode("utf-8-sig"),
-                           file_name="pwmi_predictions.csv",
+                           file_name="pbi_predictions.csv",
                            mime="text/csv")
     except Exception as e:
         st.error(TEXT["read_fail"][LANG] + str(e))
 
 st.divider()
 st.caption("Roadmap: SHAP/EBM explain, stricter schema validation, PDF export, FastAPI.")
+
 
